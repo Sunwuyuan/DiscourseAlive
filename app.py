@@ -1,4 +1,6 @@
 # -*- coding: utf-8 -*-
+# cron:0 9 * * *
+# new Env("DiscourseAlive")
 import os
 import time
 import logging
