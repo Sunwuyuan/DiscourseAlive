@@ -1,13 +1,11 @@
 # -*- coding: utf-8 -*-
-# cron:0 9 * * *
-# new Env("DiscourseAlive")
 import os
 import time
 import logging
 import random
-import re
+import json
 from os import path
-from urllib.parse import urlparse
+from io import StringIO
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
@@ -18,69 +16,95 @@ from selenium.common.exceptions import (
     TimeoutException,
     NoSuchElementException,
     WebDriverException,
-    ElementClickInterceptedException,
-    StaleElementReferenceException,
-    ElementNotInteractableException
 )
 import shutil
+from urllib.parse import urlparse
+from dotenv import load_dotenv
 
-# take environment variables
+load_dotenv()
+
 # 配置日志
-logging.basicConfig(
-    level=logging.INFO,
-    format="[%(asctime)s] %(message)s",
-    datefmt="%H:%M:%S"
-)
 logger = logging.getLogger()
+logger.setLevel(logging.INFO)
 
-def safe_click(driver, element, max_attempts=3):
-    """安全点击元素，处理各种点击异常"""
-    for attempt in range(max_attempts):
-        try:
-            # 等待元素可见和可点击
-            WebDriverWait(driver, 10).until(
-                EC.element_to_be_clickable(element)
-            )
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.INFO)
 
-            # 尝试滚动到元素位置
-            driver.execute_script("arguments[0].scrollIntoView({behavior: 'smooth', block: 'center'});", element)
-            time.sleep(1)  # 等待滚动完成
+formatter = logging.Formatter(
+    "[%(asctime)s %(levelname)s] %(message)s", datefmt="%H:%M:%S"
+)
 
-            # 尝试常规点击
-            try:
-                element.click()
-                return True
-            except (ElementClickInterceptedException, ElementNotInteractableException):
-                # 如果常规点击失败，尝试JavaScript点击
-                driver.execute_script("arguments[0].click();", element)
-                return True
+console_handler.setFormatter(formatter)
+logger.addHandler(console_handler)
 
-        except StaleElementReferenceException:
-            if attempt == max_attempts - 1:
-                logger.error("   ❌ 元素已过期")
-                return False
-            time.sleep(1)
-            continue
-        except Exception as e:
-            if attempt == max_attempts - 1:
-                logger.error(f"   ❌ 点击失败: {str(e)[:50]}")
-                return False
-            time.sleep(1)
-            continue
-    return False
+# 解析账户配置
+accounts = []
 
-def wait_for_element(driver, by, value, timeout=10):
-    """等待元素出现并返回"""
-    try:
-        element = WebDriverWait(driver, timeout).until(
-            EC.presence_of_element_located((by, value))
-        )
-        return element
-    except TimeoutException:
-        return None
+# 首先处理 DISCOURSE_USER
+discourse_user = os.getenv("DISCOURSE_USER", "").strip()
+if discourse_user:
+    parts = discourse_user.split()
+    if len(parts) == 3:
+        forum_url, username, password = parts
+        if not forum_url.startswith(('http://', 'https://')):
+            forum_url = f'https://{forum_url}'
+        domain = urlparse(forum_url).netloc
+        view_count = int(os.getenv("VIEW_COUNT", "1000"))
+        scroll_duration = int(os.getenv("SCROLL_DURATION", "5"))
+        accounts.append({
+            'forum_url': forum_url,
+            'username': username,
+            'password': password,
+            'domain': domain,
+            'view_count': view_count,
+            'scroll_duration': scroll_duration
+        })
+
+# 然后处理 DISCOURSE_USER_1, DISCOURSE_USER_2 等
+index = 1
+while True:
+    env_name = f"DISCOURSE_USER_{index}"
+    user_data = os.getenv(env_name, "").strip()
+    if not user_data:  # 如果找不到环境变量，退出循环
+        break
+
+    parts = user_data.split()
+    if len(parts) == 3:
+        forum_url, username, password = parts
+        if not forum_url.startswith(('http://', 'https://')):
+            forum_url = f'https://{forum_url}'
+        domain = urlparse(forum_url).netloc
+        view_count = int(os.getenv(f"VIEW_COUNT_{index}", "1000"))
+        scroll_duration = int(os.getenv(f"SCROLL_DURATION_{index}", "5"))
+        accounts.append({
+            'forum_url': forum_url,
+            'username': username,
+            'password': password,
+            'domain': domain,
+            'view_count': view_count,
+            'scroll_duration': scroll_duration
+        })
+    index += 1
+
+if not accounts:
+    logging.error("❌ 未找到有效的账户配置")
+    exit(1)
+
+logging.info(f"✅ 成功解析 {len(accounts)} 个账户配置")
+for acc in accounts:
+    logging.info(f"   📍 {acc['domain']} - {acc['username']}")
+
+browse_count = 0
+connect_info = ""
+like_count = 0
+account_info = []
+
+user_count = len(accounts)
+
+logging.info(f"共找到 {user_count} 个账户")
+
 
 def load_send():
-    """加载青龙面板通知模块"""
     cur_path = path.abspath(path.dirname(__file__))
     if path.exists(cur_path + "/notify.py"):
         try:
@@ -88,614 +112,485 @@ def load_send():
             return send
         except ImportError:
             return False
-    return False
-
-class DiscourseBrowser:
-    def __init__(self):
-        self.accounts = []
-        self.results = []
-        self.parse_accounts()
-        self.setup_driver()
-
-    def parse_accounts(self):
-        """解析账户配置"""
-        # 首先处理 DISCOURSE_USER
-        discourse_user = os.getenv("DISCOURSE_USER", "").strip()
-        if discourse_user:
-            self._parse_single_account(discourse_user, "DISCOURSE_USER")
-
-        # 然后处理 DISCOURSE_USER_1, DISCOURSE_USER_2 等
-        index = 1
-        while True:
-            env_name = f"DISCOURSE_USER_{index}"
-            user_data = os.getenv(env_name, "").strip()
-            if not user_data:  # 如果找不到环境变量，退出循环
-                break
-            self._parse_single_account(user_data, env_name)
-            index += 1
-
-        if not self.accounts:
-            logger.error("❌ 未找到有效的账户配置")
-            exit(1)
-
-        logger.info(f"✅ 成功解析 {len(self.accounts)} 个账户配置")
-        for acc in self.accounts:
-            logger.info(f"   📍 {acc['domain']} - {acc['username']}")
-
-    def _parse_single_account(self, user_data, env_name):
-        """解析单个账户的配置"""
-        parts = user_data.split()
-        if len(parts) != 3:
-            logger.error(f"❌ {env_name} 格式错误: {user_data}")
-            logger.error("正确格式: [论坛域名] [用户名] [密码]")
-            return
-
-        forum_url, username, password = parts
-
-        # 处理URL格式
-        if not forum_url.startswith(('http://', 'https://')):
-            forum_url = f'https://{forum_url}'
-
-        # 获取对应的VIEW_COUNT环境变量
-        view_count_env = env_name.replace("DISCOURSE_USER", "VIEW_COUNT")
-        view_count = int(os.getenv(view_count_env, "1000"))
-
-        # 获取对应的SCROLL_DURATION环境变量
-        scroll_duration_env = env_name.replace("DISCOURSE_USER", "SCROLL_DURATION")
-        scroll_duration = int(os.getenv(scroll_duration_env, "5"))
-
-        self.accounts.append({
-            'forum_url': forum_url,
-            'username': username,
-            'password': password,
-            'domain': urlparse(forum_url).netloc,
-            'view_count': view_count,
-            'scroll_duration': scroll_duration
-        })
-
-    def setup_driver(self):
-        """初始化Chrome驱动"""
-        chromedriver_path = shutil.which("chromedriver")
-        if not chromedriver_path:
-            logger.error("❌ chromedriver 未找到")
-            exit(1)
-
-        self.chrome_options = webdriver.ChromeOptions()
-        options = [
-            "--headless=new",  # 使用新版无头模式
-            "--no-sandbox",
-            "--disable-gpu",
-            "--disable-dev-shm-usage",
-            "--disable-web-security",
-            "--disable-blink-features=AutomationControlled",
-            "--disable-features=VizDisplayCompositor",
-            "--window-size=1920,1080",  # 设置更大的窗口尺寸
-            "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        ]
-        for option in options:
-            self.chrome_options.add_argument(option)
-
-        # 添加实验性选项
-        self.chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
-        self.chrome_options.add_experimental_option("useAutomationExtension", False)
-
-        self.chromedriver_path = chromedriver_path
-
-    def create_driver(self):
-        """创建新的驱动实例"""
-        driver = webdriver.Chrome(
-            service=Service(self.chromedriver_path),
-            options=self.chrome_options
-        )
-        # 注入 JavaScript 来隐藏自动化特征
-        driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
-            "source": """
-                Object.defineProperty(navigator, 'webdriver', {
-                    get: () => undefined
-                })
-            """
-        })
-        return driver
-
-    def login(self, driver, account):
-        """登录到论坛"""
-        try:
-            logger.info(f"🔑 登录 {account['domain']} - {account['username']}")
-
-            driver.get(account['forum_url'])
-            time.sleep(3)
-
-            # 查找登录按钮
-            login_selectors = [
-                ".login-button",
-                ".header-buttons .login-button",
-                "button[data-action='showLogin']",
-                "[class*='login']",
-                "a[href*='login']"
-            ]
-
-            login_button = None
-            for selector in login_selectors:
-                try:
-                    login_button = wait_for_element(driver, By.CSS_SELECTOR, selector)
-                    if login_button and safe_click(driver, login_button):
-                        break
-                except:
-                    continue
-
-            if not login_button:
-                logger.error("   ❌ 未找到登录按钮")
-                return False
-
-            time.sleep(2)
-
-            # 输入用户名
-            username_selectors = [
-                "#login-account-name",
-                "input[name='username']",
-                "input[name='login']",
-                "input[placeholder*='用户名']",
-                "input[type='text']"
-            ]
-
-            username_field = None
-            for selector in username_selectors:
-                username_field = wait_for_element(driver, By.CSS_SELECTOR, selector)
-                if username_field:
-                    break
-
-            if not username_field:
-                logger.error("   ❌ 未找到用户名输入框")
-                return False
-
-            # 清除并输入用户名
-            driver.execute_script("arguments[0].value = '';", username_field)
-            username_field.send_keys(account['username'])
-
-            # 输入密码
-            password_selectors = [
-                "#login-account-password",
-                "input[name='password']",
-                "input[type='password']"
-            ]
-
-            password_field = None
-            for selector in password_selectors:
-                password_field = wait_for_element(driver, By.CSS_SELECTOR, selector)
-                if password_field:
-                    break
-
-            if not password_field:
-                logger.error("   ❌ 未找到密码输入框")
-                return False
-
-            # 清除并输入密码
-            driver.execute_script("arguments[0].value = '';", password_field)
-            password_field.send_keys(account['password'])
-
-            # 提交登录
-            submit_selectors = [
-                "#login-button",
-                "button[type='submit']",
-                ".btn-primary",
-                "input[type='submit']",
-                "button.login-button"
-            ]
-
-            submit_button = None
-            for selector in submit_selectors:
-                try:
-                    submit_button = wait_for_element(driver, By.CSS_SELECTOR, selector)
-                    if submit_button and safe_click(driver, submit_button):
-                        break
-                except:
-                    continue
-
-            if not submit_button:
-                logger.error("   ❌ 未找到提交按钮")
-                return False
-
-            time.sleep(3)
-
-            # 验证登录成功
-            success_selectors = [
-                "#current-user",
-                ".current-user",
-                ".header-dropdown-toggle",
-                "a[href*='user']"
-            ]
-
-            for selector in success_selectors:
-                try:
-                    if wait_for_element(driver, By.CSS_SELECTOR, selector, timeout=8):
-                        logger.info("   ✅ 登录成功")
-                        return True
-                except:
-                    continue
-
-            logger.error("   ❌ 登录失败")
-            return False
-
-        except Exception as e:
-            logger.error(f"   ❌ 登录异常: {str(e)}")
-            return False
-
-    def get_topics(self, driver):
-        """获取帖子列表"""
-        topic_selectors = [
-            "#list-area .title a",
-            ".topic-list .title a",
-            "tr.topic-list-item .title a",
-            ".topic-title a",
-            ".topic-list-item h3 a",
-            ".topic-list tbody tr td.main-link a"
-        ]
-
-        topics = []
-        for selector in topic_selectors:
-            try:
-                elements = driver.find_elements(By.CSS_SELECTOR, selector)
-                if elements:
-                    topics = elements
-                    break
-            except:
-                continue
-
-        # 过滤掉无效的主题
-        valid_topics = []
-        for topic in topics:
-            try:
-                if topic.is_displayed() and topic.get_attribute("href"):
-                    valid_topics.append(topic)
-            except:
-                continue
-
-        return valid_topics
-
-    def is_pinned(self, topic):
-        """检查是否为置顶帖"""
-        try:
-            parent = topic.find_element(By.XPATH, "./ancestor::tr")
-            pinned_selectors = [
-                "[class*='pinned']",
-                "[class*='sticky']",
-                "[class*='announcement']",
-                ".pinned-icon",
-                ".fa-thumb-tack"
-            ]
-
-            for selector in pinned_selectors:
-                if parent.find_elements(By.CSS_SELECTOR, selector):
-                    return True
-            return False
-        except:
-            return False
-
-    def get_views(self, topic):
-        """获取浏览次数"""
-        try:
-            parent = topic.find_element(By.XPATH, "./ancestor::tr")
-            views_selectors = [
-                ".num.views .number",
-                ".views .number",
-                ".views-column",
-                "[title*='次浏览']",
-                "[title*='views']"
-            ]
-
-            for selector in views_selectors:
-                try:
-                    element = parent.find_element(By.CSS_SELECTOR, selector)
-                    title = element.get_attribute("title") or ""
-                    text = element.text.strip()
-
-                    # 从title或text中提取数字
-                    numbers = re.findall(r'\d+', (title + text).replace(',', ''))
-                    if numbers:
-                        return int(numbers[0])
-                except:
-                    continue
-            return 0
-        except:
-            return 0
-
-    def try_like(self, driver):
-        """尝试点赞"""
-        like_selectors = [
-            ".btn-toggle-reaction-like",
-            ".like-button",
-            "[data-action='like']",
-            "button[class*='like']",
-            ".fa-heart",
-            ".fa-thumbs-up",
-            "[title*='赞']",
-            "[title*='Like']"
-        ]
-
-        for selector in like_selectors:
-            try:
-                buttons = driver.find_elements(By.CSS_SELECTOR, selector)
-                for button in buttons:
-                    if not button.is_displayed():
-                        continue
-
-                    title = (button.get_attribute("title") or "").lower()
-                    if any(word in title for word in ['移除', 'remove', 'unlike', 'undo']):
-                        continue
-
-                    if safe_click(driver, button):
-                        time.sleep(1)  # 等待点赞动作完成
-                        return True
-            except:
-                continue
+    else:
         return False
 
-    def browse_topics(self, driver, account):
-        """浏览帖子"""
-        browse_count = like_count = 0
 
+class TopicLoader:
+    def __init__(self, driver, domain):
+        self.driver = driver
+        self.domain = domain
+        self.daily_requirements = self._load_daily_requirements()
+        self.progress = {
+            'browse_count': 0,
+            'total_time': 0
+        }
+        logging.info(f"🎯 {self.domain} 的每日目标：")
+        logging.info(f"   - 需要浏览帖子数：{self.daily_requirements['daily_views']}")
+        logging.info(f"   - 需要阅读时间：{self.daily_requirements['daily_time']}秒")
+
+    def _load_daily_requirements(self):
         try:
-            # 滚动加载更多帖子
-            logger.info("   📜 加载帖子列表...")
-            logger.info(f"   ⏱️ 滚动时间设置为 {account['scroll_duration']} 秒")
-            end_time = time.time() + account['scroll_duration']
+            with open('daily_requirements.json', 'r', encoding='utf-8') as f:
+                requirements = json.load(f)
+                if self.domain in requirements:
+                    logging.info(f"✅ 已从配置文件加载 {self.domain} 的要求")
+                    return requirements[self.domain]
+                else:
+                    logging.info(f"⚠️ 未找到 {self.domain} 的配置，使用默认值：100浏览量/200秒")
+                    return {
+                        'daily_views': 50,
+                        'daily_time': 180
+                    }
+        except FileNotFoundError:
+            logging.warning(f"⚠️ 未找到 daily_requirements.json，使用默认值：100浏览量/200秒")
+            return {
+                'daily_views': 50,
+                'daily_time': 180
+            }
+        except json.JSONDecodeError:
+            logging.error(f"❌ daily_requirements.json 格式错误，使用默认值：100浏览量/200秒")
+            return {
+                'daily_views': 50,
+                'daily_time': 180
+            }
 
-            last_height = driver.execute_script("return document.body.scrollHeight")
-            while time.time() < end_time:
-                # 滚动到页面底部
-                driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-                time.sleep(2)
+    def has_met_requirements(self):
+        req = self.daily_requirements
+        views_met = self.progress['browse_count'] >= req['daily_views']
+        time_met = self.progress['total_time'] >= req['daily_time']
 
-                # 计算新的滚动高度并比较
-                new_height = driver.execute_script("return document.body.scrollHeight")
-                if new_height == last_height:
-                    # 如果高度没有变化，等待一下再试一次
-                    time.sleep(2)
-                    new_height = driver.execute_script("return document.body.scrollHeight")
-                    if new_height == last_height:
-                        break  # 如果还是没有变化，说明已经到底了
-                last_height = new_height
+        if views_met and time_met:
+            logging.info("✅ 已达到所有要求！")
+            logging.info(f"   - 浏览量：{self.progress['browse_count']}/{req['daily_views']}")
+            logging.info(f"   - 阅读时间：{self.progress['total_time']:.1f}/{req['daily_time']}秒")
 
-            topics = self.get_topics(driver)
-            if not topics:
-                logger.warning("   ⚠️ 未找到帖子")
-                return browse_count, like_count
+        return views_met and time_met
 
-            logger.info(f"   📚 找到 {len(topics)} 个帖子")
+    def remaining_requirements(self):
+        req = self.daily_requirements
+        remaining = {
+            'views': max(0, req['daily_views'] - self.progress['browse_count']),
+            'time': max(0, req['daily_time'] - self.progress['total_time'])
+        }
 
-            # 浏览帖子（限制数量避免过长时间）
-            max_topics = min(len(topics), 20)
-            for i, topic in enumerate(topics[:max_topics], 1):
-                try:
-                    if self.is_pinned(topic):
-                        continue
+        logging.info("📊 当前进度：")
+        logging.info(f"   - 已浏览：{self.progress['browse_count']}/{req['daily_views']} 个帖子")
+        logging.info(f"   - 已阅读：{self.progress['total_time']:.1f}/{req['daily_time']} 秒")
+        if remaining['views'] > 0 or remaining['time'] > 0:
+            logging.info("⏳ 还需要：")
+            if remaining['views'] > 0:
+                logging.info(f"   - 浏览 {remaining['views']} 个帖子")
+            if remaining['time'] > 0:
+                logging.info(f"   - 阅读 {remaining['time']:.1f} 秒")
 
-                    title = topic.text.strip()[:30]
-                    if not title:
-                        continue
+        return remaining
 
-                    url = topic.get_attribute("href")
-                    if not url:
-                        continue
+    def load_topics(self, scroll_duration=5):
+        """Load topics by scrolling the page"""
+        logging.info(f"📜 开始滚动加载帖子，持续 {scroll_duration} 秒...")
+        end_time = time.time() + scroll_duration
+        actions = ActionChains(self.driver)
 
-                    views = self.get_views(topic)
+        while time.time() < end_time:
+            actions.scroll_by_amount(0, 500).perform()
+            time.sleep(0.1)
 
-                    # 新标签页打开
-                    original_handle = driver.current_window_handle
-                    driver.execute_script("window.open('');")
-                    driver.switch_to.window(driver.window_handles[-1])
+        topics = self.driver.find_elements(By.CSS_SELECTOR, "#list-area .title")
+        logging.info(f"✨ 本次加载到 {len(topics)} 个帖子")
+        return topics
 
-                    try:
-                        driver.get(url)
-                        time.sleep(2)
-                        browse_count += 1
+    def update_progress(self, browse_time):
+        """Update progress after viewing a topic"""
+        self.progress['browse_count'] += 1
+        self.progress['total_time'] += browse_time
+        logging.info("📈 更新进度：")
+        logging.info(f"   - 总浏览量：{self.progress['browse_count']}")
+        logging.info(f"   - 总阅读时间：{self.progress['total_time']:.1f}秒")
 
-                        # 高浏览量帖子点赞
-                        if views > account['view_count']:
-                            logger.info(f"   📈 帖子浏览量 {views} 超过阈值 {account['view_count']}，尝试点赞")
-                            if self.try_like(driver):
-                                like_count += 1
-                                logger.info("   👍 点赞成功")
+    def reset_to_main_page(self):
+        """Return to the main forum page to load more topics"""
+        logging.info("🔄 返回主页重新加载帖子...")
+        current_url = self.driver.current_url
+        base_url = current_url.split('?')[0].split('#')[0]
+        self.driver.get(base_url)
+        time.sleep(2)  # Wait for page to load
+        logging.info("✅ 页面重新加载完成")
 
-                        # 模拟阅读行为
-                        total_height = driver.execute_script("return document.body.scrollHeight")
-                        viewport_height = driver.execute_script("return window.innerHeight")
-                        scroll_steps = int(total_height / viewport_height) + 1
 
-                        for step in range(scroll_steps):
-                            scroll_y = step * viewport_height
-                            driver.execute_script(f"window.scrollTo(0, {scroll_y});")
-                            time.sleep(random.uniform(1, 2))
+class LinuxDoBrowser:
+    def __init__(self) -> None:
+        logging.info("启动 Selenium")
 
-                    except Exception as e:
-                        logger.debug(f"浏览帖子异常: {str(e)}")
+        global chrome_options
+        chrome_options = webdriver.ChromeOptions()
 
-                    finally:
-                        try:
-                            # 关闭当前标签页
-                            driver.close()
-                            # 切回原始标签页
-                            driver.switch_to.window(original_handle)
-                        except Exception as e:
-                            logger.error(f"   ⚠️ 标签页切换异常: {str(e)}")
-                            # 尝试恢复到一个可用的状态
-                            try:
-                                if len(driver.window_handles) > 1:
-                                    for handle in driver.window_handles[1:]:
-                                        driver.switch_to.window(handle)
-                                        driver.close()
-                                driver.switch_to.window(driver.window_handles[0])
-                            except:
-                                pass
+        # 青龙面板特定的 Chrome 选项
+        chrome_options.add_argument("--no-sandbox")
+        chrome_options.add_argument("--disable-gpu")
+        chrome_options.add_argument("--disable-dev-shm-usage")
+        chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+        chrome_options.add_argument("--disable-extensions")
+        chrome_options.add_argument('--headless=new')  # 使用新的 headless 模式
+        chrome_options.add_argument("--window-size=1920,1080")
+        chrome_options.add_argument("--start-maximized")
+        chrome_options.add_argument("--disable-notifications")
+        chrome_options.add_argument("--ignore-certificate-errors")
+        chrome_options.add_argument('--allow-running-insecure-content')
+        chrome_options.add_argument("--disable-popup-blocking")
 
-                        # 进度显示
-                        if i % 5 == 0 or i == max_topics:
-                            logger.info(f"   📖 已浏览 {browse_count}/{max_topics} 个帖子")
+        # 添加 user-agent
+        chrome_options.add_argument(
+            '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
 
-                except Exception as e:
-                    logger.debug(f"处理帖子异常: {str(e)}")
-                    # 尝试恢复到一个可用的状态
-                    try:
-                        if len(driver.window_handles) > 1:
-                            for handle in driver.window_handles[1:]:
-                                driver.switch_to.window(handle)
-                                driver.close()
-                        driver.switch_to.window(driver.window_handles[0])
-                    except:
-                        pass
+        # 禁用自动化标志
+        chrome_options.add_experimental_option('excludeSwitches', ['enable-automation'])
+        chrome_options.add_experimental_option('useAutomationExtension', False)
+
+        # 设置页面加载策略
+        chrome_options.page_load_strategy = 'normal'
+
+        # 检查 chromedriver 路径
+        global chromedriver_path
+        chromedriver_path = shutil.which("chromedriver")
+
+        if not chromedriver_path:
+            logging.error("chromedriver 未找到，请确保已安装并配置正确的路径。")
+            exit(1)
+
+        self.driver = None
+
+    def create_driver(self):
+        try:
+            service = Service(chromedriver_path)
+            self.driver = webdriver.Chrome(service=service, options=chrome_options)
+
+            # 删除 navigator.webdriver 标志
+            self.driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
+                'source': '''
+                    Object.defineProperty(navigator, 'webdriver', {
+                        get: () => undefined
+                    })
+                '''
+            })
+
+            # 设置页面加载超时
+            self.driver.set_page_load_timeout(30)
+            self.driver.implicitly_wait(10)
+
+            return True
 
         except Exception as e:
-            logger.error(f"   ❌ 浏览异常: {str(e)}")
-            # 尝试恢复到一个可用的状态
+            logging.error(f"创建 WebDriver 失败: {e}")
+            return False
+
+    def simulate_typing(self, element, text, typing_speed=0.1, random_delay=True):
+        for char in text:
+            element.send_keys(char)
+            if random_delay:
+                time.sleep(typing_speed + random.uniform(0, 0.1))
+            else:
+                time.sleep(typing_speed)
+
+    def login(self) -> bool:
+        try:
+            logging.info(f"--- 开始尝试登录：{self.username}---")
+
+            # 先等待页面加载完成
+            WebDriverWait(self.driver, 20).until(
+                lambda driver: driver.execute_script('return document.readyState') == 'complete'
+            )
+
+            # 确保在点击之前页面已完全加载
+            time.sleep(3)
+
             try:
-                if len(driver.window_handles) > 1:
-                    for handle in driver.window_handles[1:]:
-                        driver.switch_to.window(handle)
-                        driver.close()
-                driver.switch_to.window(driver.window_handles[0])
+                login_button = WebDriverWait(self.driver, 20).until(
+                    EC.element_to_be_clickable((By.CSS_SELECTOR, ".login-button .d-button-label"))
+                )
+                self.driver.execute_script("arguments[0].click();", login_button)
+            except:
+                logging.info("尝试备用登录按钮选择器")
+                login_button = WebDriverWait(self.driver, 20).until(
+                    EC.element_to_be_clickable((By.CSS_SELECTOR, "button.login-button"))
+                )
+                self.driver.execute_script("arguments[0].click();", login_button)
+
+            # 等待登录表单出现
+            WebDriverWait(self.driver, 20).until(
+                EC.presence_of_element_located((By.ID, "login-form"))
+            )
+
+            # 输入用户名
+            username_field = WebDriverWait(self.driver, 20).until(
+                EC.presence_of_element_located((By.ID, "login-account-name"))
+            )
+            username_field.clear()
+            time.sleep(1)
+            self.simulate_typing(username_field, self.username)
+
+            # 输入密码
+            password_field = WebDriverWait(self.driver, 20).until(
+                EC.presence_of_element_located((By.ID, "login-account-password"))
+            )
+            password_field.clear()
+            time.sleep(1)
+            self.simulate_typing(password_field, self.password)
+
+            # 提交登录
+            submit_button = WebDriverWait(self.driver, 20).until(
+                EC.element_to_be_clickable((By.ID, "login-button"))
+            )
+            time.sleep(1)
+            self.driver.execute_script("arguments[0].click();", submit_button)
+
+            # 验证登录结果
+            try:
+                WebDriverWait(self.driver, 15).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, "#current-user"))
+                )
+                logging.info("登录成功")
+                return True
+            except TimeoutException:
+                error_element = self.driver.find_elements(By.CSS_SELECTOR, "#modal-alert.alert-error")
+                if error_element:
+                    logging.error(f"登录失败：{error_element[0].text}")
+                else:
+                    logging.error("登录失败：无法验证登录状态")
+                return False
+
+        except Exception as e:
+            logging.error(f"登录过程发生错误：{str(e)}")
+            # 保存截图以便调试
+            try:
+                self.driver.save_screenshot("login_error.png")
+                logging.info("已保存错误截图到 login_error.png")
             except:
                 pass
+            return False
 
-        return browse_count, like_count
+    def click_topic(self):
+        try:
+            topic_loader = TopicLoader(self.driver, urlparse(self.driver.current_url).netloc)
 
-    def run(self):
-        """主运行流程"""
-        logger.info("🚀 开始执行 DiscourseAlive 任务")
-        start_time = time.time()
+            while not topic_loader.has_met_requirements():
+                logging.info("--- 开始滚动页面加载更多帖子 ---")
+                topics = topic_loader.load_topics(self.scroll_duration)
+                total_topics = len(topics)
+                remaining = topic_loader.remaining_requirements()
 
-        for i, account in enumerate(self.accounts, 1):
-            account_start = time.time()
-            logger.info(f"\n📍 [{i}/{len(self.accounts)}] 处理 {account['domain']} - {account['username']}")
+                logging.info(f"共找到 {total_topics} 个帖子")
+                logging.info(f"还需要浏览 {remaining['views']} 个帖子，累计阅读时间还差 {remaining['time']} 秒")
 
-            driver = None
-            try:
-                # 创建新的浏览器实例
-                driver = self.create_driver()
-
-                # 设置页面加载超时
-                driver.set_page_load_timeout(30)
-
-                # 设置脚本执行超时
-                driver.set_script_timeout(30)
-
-                if not self.login(driver, account):
-                    self.results.append({
-                        'domain': account['domain'],
-                        'username': account['username'],
-                        'status': '登录失败',
-                        'browse_count': 0,
-                        'like_count': 0,
-                        'time': 0
-                    })
+                if total_topics == 0:
+                    logging.warning("没有找到任何帖子，将重新加载页面")
+                    topic_loader.reset_to_main_page()
                     continue
 
-                browse_count, like_count = self.browse_topics(driver, account)
+                for idx, topic in enumerate(topics):
+                    if topic_loader.has_met_requirements():
+                        logging.info("已达到每日要求，停止浏览")
+                        break
 
-                account_time = int(time.time() - account_start)
-                self.results.append({
-                    'domain': account['domain'],
-                    'username': account['username'],
-                    'status': '完成',
-                    'browse_count': browse_count,
-                    'like_count': like_count,
-                    'time': account_time
-                })
-
-                logger.info(f"   ✅ 完成 - 浏览:{browse_count} 点赞:{like_count} 用时:{account_time}s")
-
-            except Exception as e:
-                logger.error(f"   ❌ 执行异常: {str(e)}")
-                self.results.append({
-                    'domain': account['domain'],
-                    'username': account['username'],
-                    'status': '执行异常',
-                    'browse_count': 0,
-                    'like_count': 0,
-                    'time': int(time.time() - account_start)
-                })
-
-            finally:
-                # 清理浏览器实例
-                try:
-                    if driver:
-                        # 关闭所有标签页
-                        if len(driver.window_handles) > 1:
-                            for handle in driver.window_handles[1:]:
-                                driver.switch_to.window(handle)
-                                driver.close()
-                            driver.switch_to.window(driver.window_handles[0])
-
-                        # 清除cookies和缓存
-                        driver.delete_all_cookies()
-
-                        # 执行清理脚本
-                        driver.execute_script("window.localStorage.clear();")
-                        driver.execute_script("window.sessionStorage.clear();")
-
-                        # 退出浏览器
-                        driver.quit()
-                except Exception as e:
-                    logger.error(f"   ⚠️ 清理异常: {str(e)}")
                     try:
-                        # 强制结束浏览器进程
-                        driver.quit()
-                    except:
-                        pass
+                        parent_element = topic.find_element(By.XPATH, "./ancestor::tr")
 
-                # 强制等待一段时间，确保资源完全释放
-                time.sleep(5)
+                        is_pinned = parent_element.find_elements(
+                            By.CSS_SELECTOR, ".topic-statuses .pinned"
+                        )
 
-        # 生成报告
-        total_time = int(time.time() - start_time)
-        self.generate_report(total_time)
+                        if is_pinned:
+                            logging.info(f"跳过置顶的帖子：{topic.text.strip()}")
+                            continue
 
-    def generate_report(self, total_time):
-        """生成执行报告"""
-        logger.info("\n" + "="*50)
-        logger.info("📊 执行报告")
-        logger.info("="*50)
+                        views_element = parent_element.find_element(
+                            By.CSS_SELECTOR, ".num.views .number"
+                        )
+                        views_title = views_element.get_attribute("title")
 
-        total_browse = sum(r['browse_count'] for r in self.results)
-        total_like = sum(r['like_count'] for r in self.results)
-        success_count = sum(1 for r in self.results if r['status'] == '完成')
+                        if "此话题已被浏览 " in views_title and " 次" in views_title:
+                            views_count_str = views_title.split("此话题已被浏览 ")[1].split(" 次")[0]
+                            views_count = int(views_count_str.replace(",", ""))
+                        else:
+                            logging.warning(f"无法解析浏览次数，跳过该帖子: {views_title}")
+                            continue
 
-        # 控制台输出
-        for result in self.results:
-            status_icon = "✅" if result['status'] == '完成' else "❌"
-            logger.info(f"{status_icon} {result['domain']} - {result['username']}")
-            logger.info(f"   状态:{result['status']} 浏览:{result['browse_count']} 点赞:{result['like_count']} 用时:{result['time']}s")
+                        article_title = topic.text.strip()
+                        logging.info(f"打开第 {idx + 1}/{total_topics} 个帖子 ：{article_title}")
+                        article_url = topic.get_attribute("href")
 
-        logger.info("-" * 50)
-        logger.info(f"🎯 总计: {success_count}/{len(self.results)} 成功")
-        logger.info(f"📚 总浏览: {total_browse} 个帖子")
-        logger.info(f"👍 总点赞: {total_like} 次")
-        logger.info(f"⏱️ 总用时: {total_time//60}分{total_time%60}秒")
+                        try:
+                            self.driver.execute_script("window.open('');")
+                            self.driver.switch_to.window(self.driver.window_handles[-1])
 
-        # 通知推送
+                            browse_start_time = time.time()
+                            self.driver.set_page_load_timeout(10)
+                            try:
+                                self.driver.get(article_url)
+                            except TimeoutException:
+                                logging.warning(f"加载帖子超时: {article_title}")
+                                raise
+
+                            global browse_count
+                            browse_count += 1
+
+                            if views_count > self.view_count:
+                                logging.info(f"📈 当前帖子浏览量为{views_count} 大于设定值 {self.view_count}，🥳 开始进行点赞操作")
+                                self.click_like()
+
+                            scroll_duration = random.uniform(5, 10)
+                            try:
+                                while time.time() - browse_start_time < scroll_duration:
+                                    self.driver.execute_script(
+                                        "window.scrollBy(0, window.innerHeight);"
+                                    )
+                                    time.sleep(1)
+                            except Exception as e:
+                                logging.warning(f"在滚动过程中发生错误: {e}")
+
+                            browse_end_time = time.time()
+                            total_browse_time = browse_end_time - browse_start_time
+                            topic_loader.update_progress(total_browse_time)
+                            logging.info(f"浏览该帖子时间: {total_browse_time:.2f}秒")
+
+                        except Exception as e:
+                            logging.error(f"处理帖子时发生错误: {e}")
+
+                        finally:
+                            if len(self.driver.window_handles) > 1:
+                                self.driver.close()
+                                self.driver.switch_to.window(self.driver.window_handles[0])
+                            logging.info(f"已关闭第 {idx + 1}/{total_topics} 个帖子 ： {article_title}")
+
+                    except Exception as e:
+                        logging.error(f"处理帖子 {idx + 1} 时发生错误: {e}")
+                        continue
+
+                if not topic_loader.has_met_requirements():
+                    logging.info("当前页面帖子已处理完，但未达到要求，将重新加载页面")
+                    topic_loader.reset_to_main_page()
+
+            logging.info("所有要求已完成")
+
+        except Exception as e:
+            logging.error(f"click_topic 方法发生错误: {e}")
+
+    def click_like(self):
+        try:
+            global like_count
+            like_button = WebDriverWait(self.driver, 10).until(
+                EC.element_to_be_clickable(
+                    (By.CSS_SELECTOR, ".btn-toggle-reaction-like")
+                )
+            )
+
+            if "移除此赞" in like_button.get_attribute("title"):
+                logging.info("该帖子已点赞，跳过点赞操作。")
+            else:
+                self.driver.execute_script("arguments[0].click();", like_button)
+                like_count += 1
+                logging.info("点赞帖子成功")
+
+        except TimeoutException:
+            logging.error("点赞操作失败：点赞按钮定位超时")
+        except WebDriverException as e:
+            logging.error(f"点赞操作失败: {e}")
+        except Exception as e:
+            logging.error(f"未知错误导致点赞操作失败: {e}")
+    def run(self):
+        """主运行流程"""
+        global browse_count
+        global like_count
+
+        for i in range(user_count):
+            start_time = time.time()
+            self.username = accounts[i]['username']
+            self.password = accounts[i]['password']
+            self.view_count = accounts[i]['view_count']
+            self.scroll_duration = accounts[i]['scroll_duration']
+            domain = accounts[i]['domain']
+
+            logging.info(f"▶️▶️▶️  开始执行第{i + 1}个账号: {domain} - {self.username}")
+
+            try:
+                if not self.create_driver():
+                    logging.error("创建浏览器实例失败，跳过当前账号")
+                    continue
+
+                logging.info(f"导航到 {domain}")
+                self.driver.get(accounts[i]['forum_url'])
+
+                if not self.login():
+                    logging.error(f"{self.username} 登录失败")
+                    continue
+
+                self.click_topic()
+                logging.info(f"🎉 恭喜：{self.username}，帖子浏览全部完成")
+
+                self.logout()
+
+            except WebDriverException as e:
+                logging.error(f"WebDriver 初始化失败: {e}")
+                logging.info("请尝试重新搭建青龙面板或换个机器运行")
+                exit(1)
+            except Exception as e:
+                logging.error(f"运行过程中出错: {e}")
+            finally:
+                if self.driver is not None:
+                    self.driver.quit()
+
+            end_time = time.time()
+            spend_time = int((end_time - start_time) // 60)
+
+            account_info.append({
+                "domain": domain,
+                "username": self.username,
+                "browse_count": browse_count,
+                "like_count": like_count,
+                "spend_time": spend_time
+            })
+
+            # 重置状态
+            browse_count = 0
+            like_count = 0
+
+        logging.info("\n" + "="*50)
+        logging.info("📊 执行报告")
+        logging.info("="*50)
+
+        total_browse = sum(r['browse_count'] for r in account_info)
+        total_like = sum(r['like_count'] for r in account_info)
+
+        # 生成摘要
         summary = f"运行完成\n\n"
-        summary += f"成功率: {success_count}/{len(self.results)}\n"
         summary += f"总浏览: {total_browse} 个帖子\n"
-        summary += f"总点赞: {total_like} 次\n"
-        summary += f"总用时: {total_time//60}分{total_time%60}秒\n\n"
+        summary += f"总点赞: {total_like} 次\n\n"
 
-        for result in self.results:
-            summary += f"{result['domain']} - {result['username']}\n"
-            summary += f"  {result['status']} | 浏览:{result['browse_count']} | 点赞:{result['like_count']}\n\n"
+        for info in account_info:
+            summary += f"{info['domain']} - {info['username']}\n"
+            summary += f"浏览: {info['browse_count']} | 点赞: {info['like_count']} | 用时: {info['spend_time']}分钟\n\n"
+            # 控制台输出
+            logging.info(f"✅ {info['domain']} - {info['username']}")
+            logging.info(f"   浏览:{info['browse_count']} 点赞:{info['like_count']} 用时:{info['spend_time']}分钟")
+
+        logging.info("-" * 50)
+        logging.info(f"📚 总浏览: {total_browse} 个帖子")
+        logging.info(f"👍 总点赞: {total_like} 次")
 
         send = load_send()
         if callable(send):
-            send("DiscourseAlive 运行完成", summary)
+            send("Discourse浏览帖子", summary)
         else:
-            logger.info("📤 未配置通知推送")
+            logging.info("📤 未配置通知推送")
 
 
 if __name__ == "__main__":
     try:
-        browser = DiscourseBrowser()
-        browser.run()
+        linuxdo_browser = LinuxDoBrowser()
+        linuxdo_browser.run()
     except KeyboardInterrupt:
-        logger.info("\n⏹️ 用户中断执行")
+        logging.info("\n⏹️ 用户中断执行")
     except Exception as e:
-        logger.error(f"❌ 程序异常: {e}")
+        logging.error(f"❌ 程序异常: {e}")
     finally:
-        logger.info("🏁 程序结束")
+        logging.info("🏁 程序结束")
