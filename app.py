@@ -18,9 +18,13 @@ from selenium.common.exceptions import (
     TimeoutException,
     NoSuchElementException,
     WebDriverException,
+    ElementClickInterceptedException,
+    StaleElementReferenceException,
+    ElementNotInteractableException
 )
 import shutil
 
+# take environment variables
 # 配置日志
 logging.basicConfig(
     level=logging.INFO,
@@ -28,6 +32,52 @@ logging.basicConfig(
     datefmt="%H:%M:%S"
 )
 logger = logging.getLogger()
+
+def safe_click(driver, element, max_attempts=3):
+    """安全点击元素，处理各种点击异常"""
+    for attempt in range(max_attempts):
+        try:
+            # 等待元素可见和可点击
+            WebDriverWait(driver, 10).until(
+                EC.element_to_be_clickable(element)
+            )
+
+            # 尝试滚动到元素位置
+            driver.execute_script("arguments[0].scrollIntoView({behavior: 'smooth', block: 'center'});", element)
+            time.sleep(1)  # 等待滚动完成
+
+            # 尝试常规点击
+            try:
+                element.click()
+                return True
+            except (ElementClickInterceptedException, ElementNotInteractableException):
+                # 如果常规点击失败，尝试JavaScript点击
+                driver.execute_script("arguments[0].click();", element)
+                return True
+
+        except StaleElementReferenceException:
+            if attempt == max_attempts - 1:
+                logger.error("   ❌ 元素已过期")
+                return False
+            time.sleep(1)
+            continue
+        except Exception as e:
+            if attempt == max_attempts - 1:
+                logger.error(f"   ❌ 点击失败: {str(e)[:50]}")
+                return False
+            time.sleep(1)
+            continue
+    return False
+
+def wait_for_element(driver, by, value, timeout=10):
+    """等待元素出现并返回"""
+    try:
+        element = WebDriverWait(driver, timeout).until(
+            EC.presence_of_element_located((by, value))
+        )
+        return element
+    except TimeoutException:
+        return None
 
 def load_send():
     """加载青龙面板通知模块"""
@@ -39,7 +89,6 @@ def load_send():
         except ImportError:
             return False
     return False
-
 
 class DiscourseBrowser:
     def __init__(self):
@@ -113,24 +162,40 @@ class DiscourseBrowser:
 
         self.chrome_options = webdriver.ChromeOptions()
         options = [
-            "--headless",
-            "--no-sandbox", "--disable-gpu",
-            "--disable-dev-shm-usage", "--disable-web-security",
+            "--headless=new",  # 使用新版无头模式
+            "--no-sandbox",
+            "--disable-gpu",
+            "--disable-dev-shm-usage",
+            "--disable-web-security",
             "--disable-blink-features=AutomationControlled",
             "--disable-features=VizDisplayCompositor",
-            "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            "--window-size=1920,1080",  # 设置更大的窗口尺寸
+            "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         ]
         for option in options:
             self.chrome_options.add_argument(option)
+
+        # 添加实验性选项
+        self.chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        self.chrome_options.add_experimental_option("useAutomationExtension", False)
 
         self.chromedriver_path = chromedriver_path
 
     def create_driver(self):
         """创建新的驱动实例"""
-        return webdriver.Chrome(
+        driver = webdriver.Chrome(
             service=Service(self.chromedriver_path),
             options=self.chrome_options
         )
+        # 注入 JavaScript 来隐藏自动化特征
+        driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+            "source": """
+                Object.defineProperty(navigator, 'webdriver', {
+                    get: () => undefined
+                })
+            """
+        })
+        return driver
 
     def login(self, driver, account):
         """登录到论坛"""
@@ -142,106 +207,110 @@ class DiscourseBrowser:
 
             # 查找登录按钮
             login_selectors = [
-                ".login-button", ".header-buttons .login-button",
-                "button[data-action='showLogin']", "[class*='login']"
+                ".login-button",
+                ".header-buttons .login-button",
+                "button[data-action='showLogin']",
+                "[class*='login']",
+                "a[href*='login']"
             ]
 
             login_button = None
             for selector in login_selectors:
                 try:
-                    login_button = WebDriverWait(driver, 8).until(
-                        EC.element_to_be_clickable((By.CSS_SELECTOR, selector))
-                    )
-                    break
-                except TimeoutException:
+                    login_button = wait_for_element(driver, By.CSS_SELECTOR, selector)
+                    if login_button and safe_click(driver, login_button):
+                        break
+                except:
                     continue
 
             if not login_button:
                 logger.error("   ❌ 未找到登录按钮")
                 return False
 
-            login_button.click()
             time.sleep(2)
 
             # 输入用户名
             username_selectors = [
-                "#login-account-name", "input[name='username']",
-                "input[name='login']", "input[placeholder*='用户名']"
+                "#login-account-name",
+                "input[name='username']",
+                "input[name='login']",
+                "input[placeholder*='用户名']",
+                "input[type='text']"
             ]
 
             username_field = None
             for selector in username_selectors:
-                try:
-                    username_field = WebDriverWait(driver, 8).until(
-                        EC.presence_of_element_located((By.CSS_SELECTOR, selector))
-                    )
+                username_field = wait_for_element(driver, By.CSS_SELECTOR, selector)
+                if username_field:
                     break
-                except TimeoutException:
-                    continue
 
             if not username_field:
                 logger.error("   ❌ 未找到用户名输入框")
                 return False
 
-            username_field.clear()
+            # 清除并输入用户名
+            driver.execute_script("arguments[0].value = '';", username_field)
             username_field.send_keys(account['username'])
 
             # 输入密码
             password_selectors = [
-                "#login-account-password", "input[name='password']",
+                "#login-account-password",
+                "input[name='password']",
                 "input[type='password']"
             ]
 
             password_field = None
             for selector in password_selectors:
-                try:
-                    password_field = WebDriverWait(driver, 8).until(
-                        EC.presence_of_element_located((By.CSS_SELECTOR, selector))
-                    )
+                password_field = wait_for_element(driver, By.CSS_SELECTOR, selector)
+                if password_field:
                     break
-                except TimeoutException:
-                    continue
 
             if not password_field:
                 logger.error("   ❌ 未找到密码输入框")
                 return False
 
-            password_field.clear()
+            # 清除并输入密码
+            driver.execute_script("arguments[0].value = '';", password_field)
             password_field.send_keys(account['password'])
 
             # 提交登录
             submit_selectors = [
-                "#login-button", "button[type='submit']",
-                ".btn-primary", "input[type='submit']"
+                "#login-button",
+                "button[type='submit']",
+                ".btn-primary",
+                "input[type='submit']",
+                "button.login-button"
             ]
 
             submit_button = None
             for selector in submit_selectors:
                 try:
-                    submit_button = WebDriverWait(driver, 8).until(
-                        EC.element_to_be_clickable((By.CSS_SELECTOR, selector))
-                    )
-                    break
-                except TimeoutException:
+                    submit_button = wait_for_element(driver, By.CSS_SELECTOR, selector)
+                    if submit_button and safe_click(driver, submit_button):
+                        break
+                except:
                     continue
 
-            if submit_button:
-                submit_button.click()
-                time.sleep(3)
+            if not submit_button:
+                logger.error("   ❌ 未找到提交按钮")
+                return False
+
+            time.sleep(3)
 
             # 验证登录成功
             success_selectors = [
-                "#current-user", ".current-user", ".header-dropdown-toggle"
+                "#current-user",
+                ".current-user",
+                ".header-dropdown-toggle",
+                "a[href*='user']"
             ]
 
             for selector in success_selectors:
                 try:
-                    WebDriverWait(driver, 8).until(
-                        EC.presence_of_element_located((By.CSS_SELECTOR, selector))
-                    )
-                    logger.info("   ✅ 登录成功")
-                    return True
-                except TimeoutException:
+                    if wait_for_element(driver, By.CSS_SELECTOR, selector, timeout=8):
+                        logger.info("   ✅ 登录成功")
+                        return True
+                except:
                     continue
 
             logger.error("   ❌ 登录失败")
@@ -254,24 +323,51 @@ class DiscourseBrowser:
     def get_topics(self, driver):
         """获取帖子列表"""
         topic_selectors = [
-            "#list-area .title", ".topic-list .title",
-            "tr.topic-list-item .title", ".topic-title"
+            "#list-area .title a",
+            ".topic-list .title a",
+            "tr.topic-list-item .title a",
+            ".topic-title a",
+            ".topic-list-item h3 a",
+            ".topic-list tbody tr td.main-link a"
         ]
 
+        topics = []
         for selector in topic_selectors:
             try:
-                topics = driver.find_elements(By.CSS_SELECTOR, selector)
-                if topics:
-                    return topics
+                elements = driver.find_elements(By.CSS_SELECTOR, selector)
+                if elements:
+                    topics = elements
+                    break
             except:
                 continue
-        return []
+
+        # 过滤掉无效的主题
+        valid_topics = []
+        for topic in topics:
+            try:
+                if topic.is_displayed() and topic.get_attribute("href"):
+                    valid_topics.append(topic)
+            except:
+                continue
+
+        return valid_topics
 
     def is_pinned(self, topic):
         """检查是否为置顶帖"""
         try:
             parent = topic.find_element(By.XPATH, "./ancestor::tr")
-            return bool(parent.find_elements(By.CSS_SELECTOR, "[class*='pinned']"))
+            pinned_selectors = [
+                "[class*='pinned']",
+                "[class*='sticky']",
+                "[class*='announcement']",
+                ".pinned-icon",
+                ".fa-thumb-tack"
+            ]
+
+            for selector in pinned_selectors:
+                if parent.find_elements(By.CSS_SELECTOR, selector):
+                    return True
+            return False
         except:
             return False
 
@@ -279,7 +375,13 @@ class DiscourseBrowser:
         """获取浏览次数"""
         try:
             parent = topic.find_element(By.XPATH, "./ancestor::tr")
-            views_selectors = [".num.views .number", ".views .number"]
+            views_selectors = [
+                ".num.views .number",
+                ".views .number",
+                ".views-column",
+                "[title*='次浏览']",
+                "[title*='views']"
+            ]
 
             for selector in views_selectors:
                 try:
@@ -300,20 +402,30 @@ class DiscourseBrowser:
     def try_like(self, driver):
         """尝试点赞"""
         like_selectors = [
-            ".btn-toggle-reaction-like", ".like-button",
-            "[data-action='like']", "button[class*='like']"
+            ".btn-toggle-reaction-like",
+            ".like-button",
+            "[data-action='like']",
+            "button[class*='like']",
+            ".fa-heart",
+            ".fa-thumbs-up",
+            "[title*='赞']",
+            "[title*='Like']"
         ]
 
         for selector in like_selectors:
             try:
-                button = WebDriverWait(driver, 3).until(
-                    EC.element_to_be_clickable((By.CSS_SELECTOR, selector))
-                )
+                buttons = driver.find_elements(By.CSS_SELECTOR, selector)
+                for button in buttons:
+                    if not button.is_displayed():
+                        continue
 
-                title = button.get_attribute("title") or ""
-                if not any(word in title.lower() for word in ['移除', 'remove', 'unlike']):
-                    driver.execute_script("arguments[0].click();", button)
-                    return True
+                    title = (button.get_attribute("title") or "").lower()
+                    if any(word in title for word in ['移除', 'remove', 'unlike', 'undo']):
+                        continue
+
+                    if safe_click(driver, button):
+                        time.sleep(1)  # 等待点赞动作完成
+                        return True
             except:
                 continue
         return False
@@ -326,11 +438,23 @@ class DiscourseBrowser:
             # 滚动加载更多帖子
             logger.info("   📜 加载帖子列表...")
             logger.info(f"   ⏱️ 滚动时间设置为 {account['scroll_duration']} 秒")
-            end_time = time.time() + account['scroll_duration']  # 使用账户特定的滚动时间
+            end_time = time.time() + account['scroll_duration']
 
+            last_height = driver.execute_script("return document.body.scrollHeight")
             while time.time() < end_time:
+                # 滚动到页面底部
                 driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-                time.sleep(1)
+                time.sleep(2)
+
+                # 计算新的滚动高度并比较
+                new_height = driver.execute_script("return document.body.scrollHeight")
+                if new_height == last_height:
+                    # 如果高度没有变化，等待一下再试一次
+                    time.sleep(2)
+                    new_height = driver.execute_script("return document.body.scrollHeight")
+                    if new_height == last_height:
+                        break  # 如果还是没有变化，说明已经到底了
+                last_height = new_height
 
             topics = self.get_topics(driver)
             if not topics:
@@ -341,7 +465,7 @@ class DiscourseBrowser:
 
             # 浏览帖子（限制数量避免过长时间）
             max_topics = min(len(topics), 20)
-            for i, topic in enumerate(topics[:max_topics]):
+            for i, topic in enumerate(topics[:max_topics], 1):
                 try:
                     if self.is_pinned(topic):
                         continue
@@ -370,10 +494,16 @@ class DiscourseBrowser:
                             logger.info(f"   📈 帖子浏览量 {views} 超过阈值 {account['view_count']}，尝试点赞")
                             if self.try_like(driver):
                                 like_count += 1
+                                logger.info("   👍 点赞成功")
 
-                        # 模拟阅读
-                        for _ in range(random.randint(2, 4)):
-                            driver.execute_script("window.scrollBy(0, window.innerHeight);")
+                        # 模拟阅读行为
+                        total_height = driver.execute_script("return document.body.scrollHeight")
+                        viewport_height = driver.execute_script("return window.innerHeight")
+                        scroll_steps = int(total_height / viewport_height) + 1
+
+                        for step in range(scroll_steps):
+                            scroll_y = step * viewport_height
+                            driver.execute_script(f"window.scrollTo(0, {scroll_y});")
                             time.sleep(random.uniform(1, 2))
 
                     except Exception as e:
@@ -384,8 +514,8 @@ class DiscourseBrowser:
                         driver.switch_to.window(driver.window_handles[0])
 
                         # 进度显示
-                        if (i + 1) % 5 == 0:
-                            logger.info(f"   📖 已浏览 {browse_count} 个帖子")
+                        if i % 5 == 0 or i == max_topics:
+                            logger.info(f"   📖 已浏览 {browse_count}/{max_topics} 个帖子")
 
                 except Exception as e:
                     logger.debug(f"处理帖子异常: {str(e)[:30]}")
