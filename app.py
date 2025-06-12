@@ -113,7 +113,7 @@ class DiscourseBrowser:
 
         self.chrome_options = webdriver.ChromeOptions()
         options = [
-            # "--headless",
+            "--headless",
             "--no-sandbox", "--disable-gpu",
             "--disable-dev-shm-usage", "--disable-web-security",
             "--disable-blink-features=AutomationControlled",
