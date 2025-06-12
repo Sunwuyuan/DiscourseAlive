@@ -20,9 +20,7 @@ from selenium.common.exceptions import (
     WebDriverException,
 )
 import shutil
-from dotenv import load_dotenv
 
-load_dotenv()  # take environment variables
 # 配置日志
 logging.basicConfig(
     level=logging.INFO,
