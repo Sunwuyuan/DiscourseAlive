@@ -317,7 +317,7 @@ class DiscourseBrowser:
             return False
 
         except Exception as e:
-            logger.error(f"   ❌ 登录异常: {str(e)[:50]}")
+            logger.error(f"   ❌ 登录异常: {str(e)}")
             return False
 
     def get_topics(self, driver):
@@ -481,6 +481,7 @@ class DiscourseBrowser:
                     views = self.get_views(topic)
 
                     # 新标签页打开
+                    original_handle = driver.current_window_handle
                     driver.execute_script("window.open('');")
                     driver.switch_to.window(driver.window_handles[-1])
 
@@ -507,24 +508,53 @@ class DiscourseBrowser:
                             time.sleep(random.uniform(1, 2))
 
                     except Exception as e:
-                        logger.debug(f"浏览帖子异常: {str(e)[:30]}")
+                        logger.debug(f"浏览帖子异常: {str(e)}")
 
                     finally:
-                        driver.close()
-                        driver.switch_to.window(driver.window_handles[0])
+                        try:
+                            # 关闭当前标签页
+                            driver.close()
+                            # 切回原始标签页
+                            driver.switch_to.window(original_handle)
+                        except Exception as e:
+                            logger.error(f"   ⚠️ 标签页切换异常: {str(e)}")
+                            # 尝试恢复到一个可用的状态
+                            try:
+                                if len(driver.window_handles) > 1:
+                                    for handle in driver.window_handles[1:]:
+                                        driver.switch_to.window(handle)
+                                        driver.close()
+                                driver.switch_to.window(driver.window_handles[0])
+                            except:
+                                pass
 
                         # 进度显示
                         if i % 5 == 0 or i == max_topics:
                             logger.info(f"   📖 已浏览 {browse_count}/{max_topics} 个帖子")
 
                 except Exception as e:
-                    logger.debug(f"处理帖子异常: {str(e)[:30]}")
-                    if len(driver.window_handles) > 1:
-                        driver.close()
+                    logger.debug(f"处理帖子异常: {str(e)}")
+                    # 尝试恢复到一个可用的状态
+                    try:
+                        if len(driver.window_handles) > 1:
+                            for handle in driver.window_handles[1:]:
+                                driver.switch_to.window(handle)
+                                driver.close()
                         driver.switch_to.window(driver.window_handles[0])
+                    except:
+                        pass
 
         except Exception as e:
-            logger.error(f"   ❌ 浏览异常: {str(e)[:50]}")
+            logger.error(f"   ❌ 浏览异常: {str(e)}")
+            # 尝试恢复到一个可用的状态
+            try:
+                if len(driver.window_handles) > 1:
+                    for handle in driver.window_handles[1:]:
+                        driver.switch_to.window(handle)
+                        driver.close()
+                driver.switch_to.window(driver.window_handles[0])
+            except:
+                pass
 
         return browse_count, like_count
 
@@ -539,7 +569,14 @@ class DiscourseBrowser:
 
             driver = None
             try:
+                # 创建新的浏览器实例
                 driver = self.create_driver()
+
+                # 设置页面加载超时
+                driver.set_page_load_timeout(30)
+
+                # 设置脚本执行超时
+                driver.set_script_timeout(30)
 
                 if not self.login(driver, account):
                     self.results.append({
@@ -567,7 +604,7 @@ class DiscourseBrowser:
                 logger.info(f"   ✅ 完成 - 浏览:{browse_count} 点赞:{like_count} 用时:{account_time}s")
 
             except Exception as e:
-                logger.error(f"   ❌ 执行异常: {str(e)[:50]}")
+                logger.error(f"   ❌ 执行异常: {str(e)}")
                 self.results.append({
                     'domain': account['domain'],
                     'username': account['username'],
@@ -578,9 +615,35 @@ class DiscourseBrowser:
                 })
 
             finally:
-                if driver:
-                    driver.quit()
-                time.sleep(2)  # 账户间隔
+                # 清理浏览器实例
+                try:
+                    if driver:
+                        # 关闭所有标签页
+                        if len(driver.window_handles) > 1:
+                            for handle in driver.window_handles[1:]:
+                                driver.switch_to.window(handle)
+                                driver.close()
+                            driver.switch_to.window(driver.window_handles[0])
+
+                        # 清除cookies和缓存
+                        driver.delete_all_cookies()
+
+                        # 执行清理脚本
+                        driver.execute_script("window.localStorage.clear();")
+                        driver.execute_script("window.sessionStorage.clear();")
+
+                        # 退出浏览器
+                        driver.quit()
+                except Exception as e:
+                    logger.error(f"   ⚠️ 清理异常: {str(e)}")
+                    try:
+                        # 强制结束浏览器进程
+                        driver.quit()
+                    except:
+                        pass
+
+                # 强制等待一段时间，确保资源完全释放
+                time.sleep(5)
 
         # 生成报告
         total_time = int(time.time() - start_time)
