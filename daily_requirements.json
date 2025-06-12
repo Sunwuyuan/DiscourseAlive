@@ -1,6 +1,10 @@
 {
     "nodeloc.cc": {
-        "daily_views": 50,
-        "daily_time": 180
+        "daily_views": 2,
+        "daily_time": 20
+    },
+    "meta.appinn.net":  {
+        "daily_views": 2,
+        "daily_time": 20
     }
 }
